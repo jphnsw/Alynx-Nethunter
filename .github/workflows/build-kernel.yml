@@ -31,6 +31,15 @@ jobs:
             clang-12 lld-12 llvm-12 \
             binutils-aarch64-linux-gnu binutils-arm-linux-gnueabihf
 
+          # Create unversioned symlinks so the kernel sub-Makefiles can find them
+          sudo ln -sf /usr/bin/clang-12        /usr/local/bin/clang
+          sudo ln -sf /usr/bin/ld.lld-12       /usr/local/bin/ld.lld
+          sudo ln -sf /usr/bin/llvm-ar-12      /usr/local/bin/llvm-ar
+          sudo ln -sf /usr/bin/llvm-nm-12      /usr/local/bin/llvm-nm
+          sudo ln -sf /usr/bin/llvm-objcopy-12 /usr/local/bin/llvm-objcopy
+          sudo ln -sf /usr/bin/llvm-objdump-12 /usr/local/bin/llvm-objdump
+          sudo ln -sf /usr/bin/llvm-strip-12   /usr/local/bin/llvm-strip
+
       - name: Build kernel
         run: |
           export ARCH=arm64
