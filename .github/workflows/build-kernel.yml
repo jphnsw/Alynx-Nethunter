@@ -1,0 +1,143 @@
+name: "Build NetHunter Kernel — Pixel 3 (blueline/crosshatch)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      ANDROID_VERSION:
+        description: 'Android version label for AnyKernel3'
+        required: true
+        default: '13,14,15'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          ref: thirteen
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates cpio flex \
+            git libelf-dev libncurses5-dev libssl-dev lz4 \
+            python3 python3-pip unzip wget zip
+
+      - name: Set up Clang 12 toolchain
+        run: |
+          mkdir -p $HOME/toolchain
+          cd $HOME/toolchain
+          # Use Google's clang prebuilt (same as used in build.config.common.clang)
+          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r416183b.tar.gz -O clang.tar.gz || \
+          wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-12.0.1/clang+llvm-12.0.1-x86_64-linux-gnu-ubuntu-16.04.tar.xz" -O clang.tar.xz
+          if [ -f clang.tar.gz ]; then
+            mkdir -p clang && tar -xf clang.tar.gz -C clang --strip-components=0 2>/dev/null || true
+          elif [ -f clang.tar.xz ]; then
+            mkdir -p clang && tar -xf clang.tar.xz -C clang --strip-components=1
+          fi
+          ls clang/bin/ | head -10 || true
+
+      - name: Set up aarch64 cross-compiler
+        run: |
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          aarch64-linux-gnu-gcc --version
+
+      - name: Build kernel
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+
+          # Try to use downloaded clang, fall back to system clang
+          if [ -f "$HOME/toolchain/clang/bin/clang" ]; then
+            export PATH="$HOME/toolchain/clang/bin:$PATH"
+            export CC=clang
+            export CLANG_TRIPLE=aarch64-linux-gnu-
+          fi
+
+          clang --version 2>/dev/null || cc --version
+
+          mkdir -p out
+
+          echo "==> Building defconfig"
+          make O=out ARCH=arm64 b1c1_defconfig
+
+          echo "==> Building kernel ($(nproc) jobs)"
+          make O=out ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            ${CC:+CC=$CC} \
+            ${CLANG_TRIPLE:+CLANG_TRIPLE=$CLANG_TRIPLE} \
+            -j$(nproc) 2>&1 | tee build.log | tail -20
+
+          echo "==> Check output"
+          ls out/arch/arm64/boot/ || { echo "BUILD FAILED — no boot images"; cat build.log | tail -50; exit 1; }
+
+      - name: Package with AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
+
+          # Configure AnyKernel3 for Pixel 3 / 3XL
+          cat > AnyKernel3/anykernel.sh << 'AKEOF'
+          # AnyKernel3 — Alynx NetHunter Kernel for Pixel 3 / 3XL
+          properties() { '
+          kernel.string=Alynx NetHunter Kernel by V3rB0se
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=blueline
+          device.name2=crosshatch
+          device.name3=bluecross
+          supported.versions=13-15
+          supported.patchlevels=
+          '; }
+
+          block=/dev/block/bootdevice/by-name/boot;
+          is_slot_device=1;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+
+          . tools/ak3-core.sh;
+          . tools/busybox.sh;
+          split_boot;
+          flash_boot;
+          AKEOF
+
+          # Copy kernel image
+          if [ -f out/arch/arm64/boot/Image.lz4-dtb ]; then
+            cp out/arch/arm64/boot/Image.lz4-dtb AnyKernel3/Image.lz4-dtb
+          elif [ -f out/arch/arm64/boot/Image.lz4 ]; then
+            cp out/arch/arm64/boot/Image.lz4 AnyKernel3/Image.lz4
+          elif [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
+            cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/Image.gz-dtb
+          fi
+
+          # Remove example anykernel.sh and leave ours
+          cd AnyKernel3
+          ls -la Image* 2>/dev/null || echo "WARNING: No kernel image found in AnyKernel3/"
+          zip -r9 ../Alynx-NetHunter-Pixel3-a15.zip . -x .git\* -x README.md
+          cd ..
+          ls -lh Alynx-NetHunter-Pixel3-a15.zip
+
+      - name: Upload kernel zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: Alynx-NetHunter-Pixel3-a15
+          path: |
+            Alynx-NetHunter-Pixel3-a15.zip
+            out/arch/arm64/boot/Image*
+          retention-days: 14
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 7
