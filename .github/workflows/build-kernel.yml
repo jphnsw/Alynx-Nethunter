@@ -26,41 +26,44 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             bc bison build-essential ca-certificates cpio flex \
             git libelf-dev libncurses5-dev libssl-dev lz4 \
-            python3 python3-pip unzip wget zip
+            python3 python3-pip unzip wget zip \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf \
+            libc6-dev-arm64-cross libc6-dev-armhf-cross
 
       - name: Set up Clang 12 toolchain
         run: |
-          mkdir -p $HOME/toolchain
+          mkdir -p $HOME/toolchain/clang
           cd $HOME/toolchain
-          # Use Google's clang prebuilt (same as used in build.config.common.clang)
-          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r416183b.tar.gz -O clang.tar.gz || \
-          wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-12.0.1/clang+llvm-12.0.1-x86_64-linux-gnu-ubuntu-16.04.tar.xz" -O clang.tar.xz
-          if [ -f clang.tar.gz ]; then
-            mkdir -p clang && tar -xf clang.tar.gz -C clang --strip-components=0 2>/dev/null || true
-          elif [ -f clang.tar.xz ]; then
-            mkdir -p clang && tar -xf clang.tar.xz -C clang --strip-components=1
-          fi
-          ls clang/bin/ | head -10 || true
-
-      - name: Set up aarch64 cross-compiler
-        run: |
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          aarch64-linux-gnu-gcc --version
+          # Use clang from LLVM apt repo
+          wget -q https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && sudo ./llvm.sh 12 || true
+          # Fallback: use distro clang
+          sudo apt-get install -y clang-12 2>/dev/null || sudo apt-get install -y clang
+          CLANG_BIN=$(which clang-12 2>/dev/null || which clang)
+          echo "Using clang: $CLANG_BIN"
+          $CLANG_BIN --version
 
       - name: Build kernel
         run: |
           export ARCH=arm64
           export SUBARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabihf-
+          export CC=$(which clang-12 2>/dev/null || which clang)
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export LD=ld.lld
+          export AR=llvm-ar
+          export NM=llvm-nm
+          export OBJCOPY=llvm-objcopy
+          export OBJDUMP=llvm-objdump
+          export STRIP=llvm-strip
 
-          # Try to use downloaded clang, fall back to system clang
-          if [ -f "$HOME/toolchain/clang/bin/clang" ]; then
-            export PATH="$HOME/toolchain/clang/bin:$PATH"
-            export CC=clang
-            export CLANG_TRIPLE=aarch64-linux-gnu-
-          fi
+          # Install lld if needed
+          sudo apt-get install -y lld llvm 2>/dev/null || true
 
-          clang --version 2>/dev/null || cc --version
+          echo "Toolchain versions:"
+          $CC --version
+          aarch64-linux-gnu-gcc --version
+          arm-linux-gnueabihf-gcc --version
 
           mkdir -p out
 
@@ -70,22 +73,28 @@ jobs:
           echo "==> Building kernel ($(nproc) jobs)"
           make O=out ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            ${CC:+CC=$CC} \
-            ${CLANG_TRIPLE:+CLANG_TRIPLE=$CLANG_TRIPLE} \
-            -j$(nproc) 2>&1 | tee build.log | tail -20
+            CROSS_COMPILE_ARM32=arm-linux-gnueabihf- \
+            CC=$CC \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            LD=${LD:-ld} \
+            AR=${AR:-ar} \
+            NM=${NM:-nm} \
+            OBJCOPY=${OBJCOPY:-objcopy} \
+            OBJDUMP=${OBJDUMP:-objdump} \
+            STRIP=${STRIP:-strip} \
+            -j$(nproc) 2>&1 | tee build.log
 
           echo "==> Check output"
-          ls out/arch/arm64/boot/ || { echo "BUILD FAILED — no boot images"; cat build.log | tail -50; exit 1; }
+          ls out/arch/arm64/boot/ || { echo "BUILD FAILED"; tail -50 build.log; exit 1; }
 
       - name: Package with AnyKernel3
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
 
-          # Configure AnyKernel3 for Pixel 3 / 3XL
           cat > AnyKernel3/anykernel.sh << 'AKEOF'
           # AnyKernel3 — Alynx NetHunter Kernel for Pixel 3 / 3XL
           properties() { '
-          kernel.string=Alynx NetHunter Kernel by V3rB0se
+          kernel.string=Alynx NetHunter Kernel by V3rB0se @ Android 13-15
           do.devicecheck=1
           do.modules=0
           do.systemless=1
@@ -109,18 +118,17 @@ jobs:
           flash_boot;
           AKEOF
 
-          # Copy kernel image
-          if [ -f out/arch/arm64/boot/Image.lz4-dtb ]; then
-            cp out/arch/arm64/boot/Image.lz4-dtb AnyKernel3/Image.lz4-dtb
-          elif [ -f out/arch/arm64/boot/Image.lz4 ]; then
-            cp out/arch/arm64/boot/Image.lz4 AnyKernel3/Image.lz4
-          elif [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
-            cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/Image.gz-dtb
-          fi
+          for img in Image.lz4-dtb Image.lz4 Image.gz-dtb Image.gz Image; do
+            if [ -f "out/arch/arm64/boot/$img" ]; then
+              cp "out/arch/arm64/boot/$img" AnyKernel3/
+              echo "Using kernel image: $img"
+              break
+            fi
+          done
 
-          # Remove example anykernel.sh and leave ours
+          ls AnyKernel3/Image* 2>/dev/null || echo "WARNING: No kernel image copied!"
+
           cd AnyKernel3
-          ls -la Image* 2>/dev/null || echo "WARNING: No kernel image found in AnyKernel3/"
           zip -r9 ../Alynx-NetHunter-Pixel3-a15.zip . -x .git\* -x README.md
           cd ..
           ls -lh Alynx-NetHunter-Pixel3-a15.zip
